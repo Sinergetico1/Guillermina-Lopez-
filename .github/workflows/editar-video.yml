@@ -1,0 +1,97 @@
+name: Editar video automáticamente
+
+on:
+  push:
+    paths:
+      - "videos/entrada/**"
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Enlace directo de descarga del video (opcional, para videos de más de 25 MB)"
+        required: false
+      subtitulos:
+        description: "Agregar subtítulos"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: editar-video-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  editar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar ffmpeg y dependencias
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          pip install -q -r editor/requirements.txt
+
+      - name: Caché del modelo de voz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-small-v1
+
+      - name: Descargar video desde enlace
+        if: ${{ github.event.inputs.video_url != '' && github.event.inputs.video_url != null }}
+        env:
+          VIDEO_URL: ${{ github.event.inputs.video_url }}
+        run: |
+          mkdir -p videos/entrada
+          curl -fL --retry 3 -o "videos/entrada/enlace-$(date +%Y%m%d-%H%M%S).mp4" "$VIDEO_URL"
+
+      - name: Editar videos nuevos
+        env:
+          SUBS: ${{ github.event.inputs.subtitulos }}
+        run: |
+          shopt -s nullglob nocaseglob
+          FLAGS=""
+          [ "$SUBS" = "false" ] && FLAGS="--sin-subtitulos"
+          mkdir -p videos/salida editados
+          for f in videos/entrada/*.{mov,mp4,m4v,avi,mkv,webm}; do
+            name="$(basename "${f%.*}")"
+            out="videos/salida/${name}-editado.mp4"
+            [ -f "$out" ] && { echo "Ya existe $out, lo salto"; continue; }
+            echo "::group::Editando $f"
+            python editor/auto_edit.py "$f" "editados/${name}-editado.mp4" $FLAGS
+            echo "::endgroup::"
+          done
+
+      - name: Guardar videos editados (descarga desde la pestaña Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: videos-editados
+          path: editados/
+          if-no-files-found: ignore
+
+      - name: Subir videos editados al repositorio
+        run: |
+          shopt -s nullglob
+          files=(editados/*.mp4)
+          [ ${#files[@]} -eq 0 ] && { echo "No hay videos nuevos"; exit 0; }
+          for f in "${files[@]}"; do
+            size=$(stat -c %s "$f")
+            if [ "$size" -lt 95000000 ]; then
+              mv "$f" videos/salida/
+            else
+              echo "::warning::$(basename "$f") pesa más de 95 MB: descárgalo desde la pestaña Actions (artefacto 'videos-editados')"
+            fi
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add videos/salida
+          git diff --cached --quiet && exit 0
+          git commit -m "Video editado automáticamente"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
